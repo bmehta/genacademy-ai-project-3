@@ -1,0 +1,1 @@
+“Each caller message advances a LangGraph workflow. Specialized agents interpret the request and prepare reviews, while Python rules control verification, troubleshooting, escalation, and approvals. Shared state is saved in SQLite, so a human can resume a pending request even after the server restarts.”
