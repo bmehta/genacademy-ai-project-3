@@ -49,6 +49,8 @@ class State(TypedDict, total=False):
     justification: str
     confirmations: list
     clarification_count: int
+    pending_issues: list
+    call_closed: bool
 
 
 class Workflow:
@@ -80,6 +82,28 @@ class Workflow:
 
     def log(self, state, name, status, detail):
         return state.get('events', []) + [{'at': now(), 'name': name, 'status': status, 'detail': detail}]
+
+    def interpret(self, state, role):
+        info = self.agents.interpret(state, role)
+        latest = next((m['text'] for m in reversed(state['messages']) if m['role'] == 'user'), '')
+        quote = info.get('human_request_evidence', '').strip()
+        explicit = bool(quote and quote.casefold() in latest.casefold()
+                        and re.search(r'\b(human|person|technician|representative|someone|agent|escalat\w*)\b', quote, re.I)
+                        and not re.search(r"\b(?:don't|do not|never|no need to)\b", quote, re.I))
+        raw_intent = info['intent']
+        if raw_intent == 'human' and not explicit:
+            info = {**info, 'intent': 'failed' if state.get('step', -1) >= 0 else 'question'}
+        purpose = info.get('justification', '').strip()
+        purpose_is_quote = bool(purpose and any(purpose.casefold() in m['text'].casefold()
+                                                for m in state['messages'] if m['role'] == 'user'))
+        info = {**info, 'justification': purpose if purpose_is_quote else ''}
+        detail = json.dumps({'raw_intent': raw_intent, 'effective_intent': info['intent'],
+                             'category': info['category'], 'category_corrected': info.get('category_corrected', False),
+                             'correction_evidence': info.get('correction_evidence', ''),
+                             'human_request_evidence': quote, 'human_request_validated': explicit,
+                             'justification_is_caller_quote': purpose_is_quote,
+                             'multiple_issues': info.get('multiple_issues', [])})
+        return {**state, 'events': self.log(state, role + '_interpretation', 'ok', detail)}, info
 
     def create(self, fault='none'):
         with self.lock:
@@ -142,10 +166,10 @@ class Workflow:
         try:
             if state['fault'] == 'model':
                 raise TimeoutError('Simulated model timeout')
-            info = self.agents.interpret(state, 'intake')
+            state, info = self.interpret(state, 'intake')
         except Exception:
             return {'route': 'escalation', 'reason': 'Intake model unavailable after bounded retry.', 'events': self.log(state, 'intake_model', 'error', 'Model unavailable; safe escalation selected.')}
-        changes = {'category': info['category'], 'justification': info['justification']}
+        changes = {'category': info['category'], 'justification': info['justification'], 'events': state['events']}
         if info['intent'] == 'human':
             return {**changes, 'route': 'escalation', 'reason': 'Caller requested a human.'}
         if not info['employee_id'] or not info['employee_name']:
@@ -170,17 +194,47 @@ class Workflow:
             n = state.get('clarification_count', 0) + 1
             if n >= 3:
                 return {**changes, 'events': events, 'route': 'escalation', 'reason': 'Employee details could not be matched.'}
-            return self.say(state, "Those details don't match our fictional directory. Please check the full name and employee ID and try again.", 'intake', **changes, events=events, route='end', clarification_count=n)
+            return self.say(state, "Those details don't match our fictional directory. Please check the full name and employee ID and try again.", 'intake', **{**changes, 'events': events}, route='end', clarification_count=n)
         return {**changes, 'verified': True, 'employee': matched, 'events': events, 'route': 'support', 'agent': 'intake', 'clarification_count': 0}
 
     def support(self, state):
         try:
-            info = self.agents.interpret(state, 'support')
+            state, info = self.interpret(state, 'support')
         except Exception:
             return {'route': 'escalation', 'reason': 'Support model unavailable.', 'events': self.log(state, 'support_model', 'error', 'Model unavailable after bounded retry.')}
-        category = state['category'] if state['category'] != 'unknown' else info['category']
+        # Keep interpreted evidence even on branches that return before a tool call.
+        result = self.support_response(state, info)
+        return {'events': state['events'], **result}
+
+    def support_response(self, state, info):
         if info['intent'] == 'human':
             return {'route': 'escalation', 'reason': 'Caller requested a human.'}
+        issues = list(dict.fromkeys(k for k in info.get('multiple_issues', []) if k in RUNBOOKS))
+        if len(issues) > 1:
+            n = state.get('clarification_count', 0) + 1
+            if n >= 3:
+                return {'route': 'escalation', 'reason': 'Unable to select a primary issue after clarification.'}
+            names = ', '.join(RUNBOOKS[k]['title'] for k in issues)
+            return self.say(state, f'You mentioned multiple issues: {names}. Which issue would you like to address first?',
+                            'support', route='end', category='unknown', step=-1, pending_issues=issues, clarification_count=n)
+        quote = info.get('correction_evidence', '').strip()
+        latest = state['messages'][-1]['text']
+        corrected = (info.get('category_corrected', False) and quote and quote.casefold() in latest.casefold()
+                     and info['category'] in RUNBOOKS and info['category'] != state['category'])
+        if corrected:
+            category = info['category']
+            events = self.log(state, 'category_correction', 'ok', json.dumps({'from': state['category'], 'to': category, 'evidence': quote}))
+            # Start the newly selected runbook even if the old issue was reported as working.
+            if category != 'access':
+                book = runbook_lookup.invoke({'category': category})
+                events = self.log({**state, 'events': events}, 'runbook_lookup', 'ok', f"Approved synthetic runbook: {book['title']}")
+                return self.say(state, book['steps'][0], 'support', category=category, step=0,
+                                clarification_count=0, pending_issues=[], route='end', events=events)
+            # Restricted access always follows the justification and approval path.
+            result = self.support_response({**state, 'category': 'access', 'step': -1, 'clarification_count': 0, 'justification': '',
+                                             'events': events}, {**info, 'category_corrected': False})
+            return {'category': 'access', 'step': -1, 'clarification_count': 0, 'pending_issues': [], 'events': events, **result}
+        category = state['category'] if state['category'] != 'unknown' else info['category']
         if category == 'unknown':
             n = state.get('clarification_count', 0) + 1
             if n >= 2:
@@ -210,7 +264,7 @@ class Workflow:
                 return {'route': 'escalation', 'reason': 'Caller needs assistance beyond the runbook.'}
         else:
             n = 0
-        return self.say(state, book['steps'][step], 'support', category=category, step=step, route='end', events=events, clarification_count=n)
+        return self.say(state, book['steps'][step], 'support', category=category, step=step, route='end', events=events, clarification_count=n, pending_issues=[])
 
     def escalation(self, state):
         events = state.get('events', [])
@@ -230,14 +284,16 @@ class Workflow:
         return self.say(state, 'I couldn’t create a ticket after two attempts. Your request is saved in this session, but no ticket exists yet. Use Retry ticket to try again.', 'escalation', outcome='ticket_failed', summary=summary, events=events)
 
     def quality(self, state):
+        call_closed = self.store.closed(state['id']) or state.get('event') == 'end'
         try:
-            report = self.agents.review(state)
+            report = self.agents.review({**state, 'call_closed': call_closed})
             source = self.agents.mode
         except Exception:
             report = {'summary': 'Automated QA model unavailable; evidence checks retained.', 'process_findings': ['Human QA review required.'], 'follow_up': ['Review transcript and tool events manually.']}
             source = 'rules_fallback'
         report.update({'outcome': state['outcome'], 'resolved': state['outcome'] == 'resolved', 'employee_matched': bool(state.get('verified')), 'caller_confirmation': state.get('confirmations', []), 'ticket_id': state.get('ticket_id'), 'tool_failures': [e for e in state.get('events', []) if e['status'] == 'error'], 'human_decision': state.get('decision'), 'generated_at': now(), 'source': source, 'follow_up_required': state['outcome'] != 'resolved'})
-        return {'review': report, 'events': self.log(state, 'quality_review', 'ok', 'Evidence-based outcome checks applied.')}
+        report['call_closed'] = call_closed
+        return {'review': report, 'call_closed': call_closed, 'events': self.log(state, 'quality_review', 'ok', 'Evidence-based outcome checks applied.')}
 
     def human_review(self, state):
         decision = interrupt({'ticket_id': state['ticket_id'], 'summary': state['summary'], 'verified': state.get('verified', False)})

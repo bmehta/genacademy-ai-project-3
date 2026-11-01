@@ -1,0 +1,4 @@
+# Reporting libraries, separate from application runtime requirements.
+openpyxl==3.1.5
+python-docx==1.2.0
+pillow==13.0.0
